@@ -1,0 +1,10 @@
+fastapi==0.111.0
+uvicorn==0.41.0
+opencv-python-headless==4.13.0.92
+numpy==2.3.1
+earthengine-api==1.7.19
+requests==2.32.4
+python-dotenv==1.2.2
+python-multipart==0.0.22
+scikit-learn==1.7.1
+joblib==1.5.1

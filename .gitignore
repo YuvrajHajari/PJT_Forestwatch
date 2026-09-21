@@ -1,0 +1,23 @@
+# Generated imagery + model artifacts (regenerable via satellite_fetch.py / train_ca_ann.py)
+static/
+*.tif
+*.png
+ca_ann_model.joblib
+ca_ann_model_stats.json
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Frontend (regenerable via npm install)
+forestwatch-frontend/node_modules/
+forestwatch-frontend/dist/
+
+# OS/editor cruft
+.DS_Store
+.vscode/
