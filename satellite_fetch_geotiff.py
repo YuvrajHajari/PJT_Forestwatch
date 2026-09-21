@@ -1,3 +1,4 @@
+import argparse
 import os
 import ee
 import requests
@@ -85,6 +86,32 @@ def fetch_nir_geotiff(city_key, cfg, year):
     return r.content
 
 
+def fetch_one(city_key, year):
+    """Fetches RGB + NIR GeoTIFFs for a single city/year. This is the
+    entry point for the "test on one city/year first" step -- confirm
+    the .tif values land around 0-1 reflectance before running fetch_all()
+    over the whole date range."""
+    init()
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    cfg = CITIES[city_key]
+    rgb_out = os.path.join(OUTPUT_DIR, f"satellite_{city_key}_{year}.tif")
+    nir_out = os.path.join(OUTPUT_DIR, f"nir_{city_key}_{year}.tif")
+
+    print(f"\U0001f4e1 {city_key} {year} RGB (GeoTIFF)...")
+    tif_bytes = fetch_rgb_geotiff(city_key, cfg, year)
+    with open(rgb_out, "wb") as f:
+        f.write(tif_bytes)
+    print(f"  \u2705 saved {rgb_out} ({len(tif_bytes)/1024:.0f} KB)")
+
+    print(f"\U0001f4e1 {city_key} {year} NIR (B8, GeoTIFF)...")
+    tif_bytes = fetch_nir_geotiff(city_key, cfg, year)
+    with open(nir_out, "wb") as f:
+        f.write(tif_bytes)
+    print(f"  \u2705 saved {nir_out} ({len(tif_bytes)/1024:.0f} KB)")
+
+    return rgb_out, nir_out
+
+
 def fetch_all():
     init()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -119,4 +146,17 @@ def fetch_all():
 
 
 if __name__ == "__main__":
-    fetch_all()
+    parser = argparse.ArgumentParser(
+        description="Fetch real Sentinel-2 SR GeoTIFFs (replaces getThumbURL PNGs)."
+    )
+    parser.add_argument("--city", choices=sorted(CITIES.keys()),
+                         help="Fetch one city/year only, e.g. --city chennai --year 2025")
+    parser.add_argument("--year", type=int)
+    args = parser.parse_args()
+
+    if args.city and args.year:
+        fetch_one(args.city, args.year)
+    elif args.city or args.year:
+        parser.error("--city and --year must be given together")
+    else:
+        fetch_all()
