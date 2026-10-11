@@ -1,8 +1,12 @@
 import argparse
 import os
+import sys
 import ee
 import requests
 from dotenv import load_dotenv
+
+if sys.stdout.encoding != "utf-8":  # Windows cp1252 console can't print the emoji below
+    sys.stdout.reconfigure(encoding="utf-8")
 
 load_dotenv()
 
@@ -13,6 +17,8 @@ GEE_PROJECT = os.environ.get("GEE_PROJECT")
 CITIES = {
     "chennai":   {"lat": 13.0827, "lon": 80.2707, "buffer_km": 6},
     "bengaluru": {"lat": 12.9716, "lon": 77.5946, "buffer_km": 6},
+    "delhi":     {"lat": 28.6139, "lon": 77.2090, "buffer_km": 6},
+    "kolkata":   {"lat": 22.5726, "lon": 88.3639, "buffer_km": 6},
 }
 
 YEARS = list(range(2016, 2026))

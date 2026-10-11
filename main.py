@@ -7,6 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 
+import raster_io
+
 load_dotenv()
 
 app = FastAPI(title="ForestWatch API")
@@ -23,6 +25,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 CITIES = {
     "bengaluru": {"label": "Bengaluru", "lat": 12.9716, "lon": 77.5946, "buffer_km": 6},
     "chennai":   {"label": "Chennai",   "lat": 13.0827, "lon": 80.2707, "buffer_km": 6},
+    "delhi":     {"label": "Delhi",     "lat": 28.6139, "lon": 77.2090, "buffer_km": 6},
+    "kolkata":   {"label": "Kolkata",   "lat": 22.5726, "lon": 88.3639, "buffer_km": 6},
 }
 
 IMAGE_SIZE = 1024
@@ -100,6 +104,27 @@ def compute_fvi(img_rgb: np.ndarray, nir_gray: np.ndarray) -> np.ndarray:
     return (nir + G - R - B) / (nir + G + R + B + 1e-6)
 
 
+
+# ---------------------------------------------------------------------------
+# Water/shadow brightness floor
+#
+# Expressed in REAL reflectance units (~0-1 scale) now that
+# satellite_fetch_geotiff.py supplies actual SR reflectance instead of a
+# gamma-stretched display PNG. Derived, not guessed: the OLD pipeline's
+# brightness>30 cutoff was measured on getThumbURL's gamma output
+# (min=0, max=3000, gamma=1.4). Solving that transform backwards for the
+# raw reflectance that would have produced display value 30:
+#   norm    = (30/255) ** 1.4  ~= 0.050
+#   raw DN  = norm * 3000      ~= 150
+#   reflectance = raw DN / 10000 ~= 0.015
+# i.e. this is the SAME operational cutoff as before, re-expressed on the
+# correct linear scale -- not a fresh unvalidated guess. Confirmed against
+# real fetched data during the migration to still correctly exclude
+# Chennai's coastal water, the original bug FVI itself was built to fix.
+# ---------------------------------------------------------------------------
+BRIGHTNESS_MIN_REFLECTANCE = 0.015
+
+
 def index_to_uint8(values: np.ndarray) -> np.ndarray:
     """Maps normalized index range [-1, 1] to 0-255 for Otsu thresholding."""
     clipped = np.clip(values, -1.0, 1.0)
@@ -171,7 +196,7 @@ def compute_fvi_mask(img_rgb: np.ndarray, nir_gray: np.ndarray,
     else:
         t1, t2 = multi_otsu_2threshold(fvi_u8.ravel())
 
-    veg = ((fvi_u8 > t2) & (brightness > 30)).astype(np.uint8) * 255
+    veg = ((fvi_u8 > t2) & (brightness > BRIGHTNESS_MIN_REFLECTANCE)).astype(np.uint8) * 255
     kernel = np.ones((5, 5), np.uint8)
     veg = cv2.morphologyEx(veg, cv2.MORPH_OPEN,  kernel)
     veg = cv2.morphologyEx(veg, cv2.MORPH_CLOSE, kernel)
@@ -192,8 +217,8 @@ def get_global_thresholds(city: str) -> tuple:
 
     all_fvi_u8 = []
     for f in sorted(os.listdir(STATIC_DIR)):
-        if f.startswith(f"satellite_{city}_") and f.endswith(".png"):
-            year = f.replace(f"satellite_{city}_", "").replace(".png", "")
+        if f.startswith(f"satellite_{city}_") and f.endswith(".tif"):
+            year = f.replace(f"satellite_{city}_", "").replace(".tif", "")
             try:
                 img = _load_satellite_raw(city, year)
                 nir = _load_nir_raw(city, year)
@@ -416,6 +441,95 @@ def multiscale_features(mask_bool: np.ndarray) -> np.ndarray:
     return feats.reshape(-1, 4)
 
 
+# ---------------------------------------------------------------------------
+# Clay v1.5 embedding features (extends multiscale_features with a frozen
+# geospatial foundation model signal)
+#
+# Deliberately does NOT import clay_features.py / torch / claymodel here --
+# this module (main.py) is the live-serving path, and the whole point of
+# extract_clay_embeddings.py running Clay OFFLINE once and caching
+# PCA-reduced tile embeddings to static/clay_reduced/*.npy is so the live
+# server only ever does a cheap numpy load, never touches the 5GB
+# checkpoint or a torch forward pass per request.
+# ---------------------------------------------------------------------------
+CLAY_REDUCED_DIR = os.path.join(STATIC_DIR, "clay_reduced")
+CLAY_TILE_SIZE = 256  # must match extract_clay_embeddings.py's TILE_SIZE
+_clay_grid_cache: dict = {}
+_clay_n_components_cache = {"n": None, "checked": False}
+
+
+def _clay_n_components() -> int:
+    """
+    Number of PCA components Clay embeddings were reduced to, read from
+    whatever cached tile grid exists (all grids share the same PCA fit --
+    see extract_clay_embeddings.py) rather than hardcoded here, so this
+    can't silently drift out of sync if N_PCA_COMPONENTS is ever changed.
+    Returns 0 if no cached embeddings exist at all yet.
+    """
+    if not _clay_n_components_cache["checked"]:
+        n = 0
+        if os.path.isdir(CLAY_REDUCED_DIR):
+            for f in os.listdir(CLAY_REDUCED_DIR):
+                if f.endswith(".npy"):
+                    n = int(np.load(os.path.join(CLAY_REDUCED_DIR, f)).shape[-1])
+                    break
+        _clay_n_components_cache["n"] = n
+        _clay_n_components_cache["checked"] = True
+    return _clay_n_components_cache["n"]
+
+
+def load_clay_reduced_grid(city: str, year: str):
+    """
+    Loads the PCA-reduced Clay embedding tile grid cached by
+    extract_clay_embeddings.py, shape (H/256, W/256, n_components).
+    Returns None if no cached embedding exists for this city/year (e.g.
+    GeoTIFF not yet fetched for it, or extract_clay_embeddings.py hasn't
+    been (re)run since) -- callers fall back to a zero-filled Clay signal
+    in that case rather than crashing.
+    """
+    key = (city, year)
+    if key not in _clay_grid_cache:
+        path = os.path.join(CLAY_REDUCED_DIR, f"{city}_{year}.npy")
+        _clay_grid_cache[key] = np.load(path) if os.path.exists(path) else None
+    return _clay_grid_cache[key]
+
+
+def multiscale_features_v2(mask_bool: np.ndarray, city: str, year: str) -> np.ndarray:
+    """
+    Extends multiscale_features() with Clay v1.5's frozen embedding for
+    the 256x256 tile each pixel falls in, broadcast from the PCA-reduced
+    per-tile vectors (see extract_clay_embeddings.py's module docstring
+    for the full extraction + reduction pipeline, and why PCA-to-8 rather
+    than Clay's raw 1024-dim embedding -- with only ~18 independent CA-ANN
+    training transitions, the raw embedding would swamp the 4 existing
+    hand-engineered features inside MLPClassifier's 16-unit first hidden
+    layer).
+
+    COARSER THAN PER-PIXEL: every pixel within the same 256x256 tile gets
+    an IDENTICAL Clay feature vector (Clay is a patch-level model, not
+    per-pixel) -- unlike the other 4 features, which vary continuously
+    per pixel. This is an honest tradeoff of the broadcasting approach,
+    not a bug.
+
+    Falls back to zero-filled Clay dims if no cached embedding exists for
+    this city/year, so mixed calls (some cities/years with Clay coverage,
+    some without) don't crash -- those samples simply carry no Clay
+    signal, which is visible/auditable rather than hidden.
+    """
+    base = multiscale_features(mask_bool)  # (H*W, 4)
+    h, w = mask_bool.shape
+    n_clay = _clay_n_components()
+
+    grid = load_clay_reduced_grid(city, year) if n_clay > 0 else None
+    if grid is None:
+        clay_feats = np.zeros((h, w, n_clay), dtype=np.float32)
+    else:
+        clay_feats = np.repeat(np.repeat(grid, CLAY_TILE_SIZE, axis=0), CLAY_TILE_SIZE, axis=1)
+        clay_feats = clay_feats[:h, :w]  # defensive crop if h/w isn't an exact tile multiple
+
+    return np.concatenate([base, clay_feats.reshape(-1, n_clay)], axis=1)
+
+
 def calibrate_proba(p_resampled: np.ndarray, beta: float) -> np.ndarray:
     """
     Prior-correction for probabilities from a model trained on a
@@ -591,9 +705,9 @@ def _prepare_city_risk_context(city: str):
         raise HTTPException(400, f"Unknown city: {city}")
 
     known_years = sorted(
-        (f.replace(f"satellite_{city}_", "").replace(".png", "")
+        (f.replace(f"satellite_{city}_", "").replace(".tif", "")
          for f in os.listdir(STATIC_DIR)
-         if f.startswith(f"satellite_{city}_") and f.endswith(".png")),
+         if f.startswith(f"satellite_{city}_") and f.endswith(".tif")),
         key=int,
     )
     if len(known_years) < 3:
@@ -613,14 +727,14 @@ def _prepare_city_risk_context(city: str):
         raise HTTPException(400, "No trained CA-ANN model found -- run train_ca_ann.py first.")
 
     latest_mask = masks_by_year[latest_year]
-    X     = multiscale_features(latest_mask)
+    X     = multiscale_features_v2(latest_mask, city, latest_year)
     raw_p = ca_ann_model.predict_proba(X)[:, 1]
     ann_score = calibrate_proba(raw_p, ca_ann_beta).reshape(latest_mask.shape)
 
     return latest_year, latest_mask, ann_score
 
 
-def project_future_mask_ca_ann(model, beta: float,
+def project_future_mask_ca_ann(model, beta: float, city: str,
                                 masks_by_year: dict, target_year: int):
     """
     CA-ANN projection.
@@ -677,7 +791,7 @@ def project_future_mask_ca_ann(model, beta: float,
     expected_loss_px = min(forest_count,     int(round(p_loss_compound * forest_count)))
 
     # WHICH: CA-ANN calibrated score, used only as a ranking signal.
-    X         = multiscale_features(latest_mask)
+    X         = multiscale_features_v2(latest_mask, city, latest_year)
     raw_p     = model.predict_proba(X)[:, 1]
     ann_score = calibrate_proba(raw_p, beta).reshape(latest_mask.shape)
 
@@ -905,33 +1019,56 @@ def make_prediction_overlay(img_rgb: np.ndarray, current_forest: np.ndarray,
 # ---------------------------------------------------------------------------
 
 def _load_satellite_raw(city: str, year: str) -> np.ndarray:
-    path = os.path.join(STATIC_DIR, f"satellite_{city}_{year}.png")
-    img  = cv2.imread(path)
-    if img is None:
-        raise FileNotFoundError(f"Missing {path}")
-    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    """Real Sentinel-2 SR reflectance (float32, ~0-1) -- used for ALL FVI/
+    Otsu analysis math. Replaces the old getThumbURL-PNG loader; see
+    raster_io.py's module docstring for why that mattered."""
+    rgb, _ = raster_io.load_satellite(city, year, STATIC_DIR)
+    return rgb
 
 
 def _load_nir_raw(city: str, year: str) -> np.ndarray:
-    path = os.path.join(STATIC_DIR, f"nir_{city}_{year}.png")
-    img  = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    """Real Sentinel-2 B8 reflectance (float32, ~0-1)."""
+    nir, _ = raster_io.load_nir(city, year, STATIC_DIR)
+    return nir
+
+
+def _load_display_raw(city: str, year: str) -> np.ndarray:
+    """
+    8-bit gamma-stretched RGB PNG (still fetched by satellite_fetch.py) --
+    used ONLY as the visual background photo composited under overlays
+    (make_overlay / make_prediction_overlay / render_risk_heatmap).
+    Deliberately kept separate from the real-reflectance analysis path
+    above: raw linear reflectance would render almost black as a display
+    image (no gamma correction), and re-adding a cosmetic stretch to the
+    ANALYSIS path is exactly the bug this migration exists to fix -- math
+    and visualization are two different jobs now, on purpose.
+    """
+    path = os.path.join(STATIC_DIR, f"satellite_{city}_{year}.png")
+    img = cv2.imread(path)
     if img is None:
         raise FileNotFoundError(f"Missing {path}")
-    return img
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
 def load_satellite(city: str, year: str) -> np.ndarray:
     try:
         return _load_satellite_raw(city, year)
     except FileNotFoundError:
-        raise HTTPException(404, f"No satellite image for {city} {year}. Run satellite_fetch.py first.")
+        raise HTTPException(404, f"No satellite GeoTIFF for {city} {year}. Run satellite_fetch_geotiff.py first.")
 
 
 def load_nir(city: str, year: str) -> np.ndarray:
     try:
         return _load_nir_raw(city, year)
     except FileNotFoundError:
-        raise HTTPException(404, f"No NIR image for {city} {year}. Run satellite_fetch.py first.")
+        raise HTTPException(404, f"No NIR GeoTIFF for {city} {year}. Run satellite_fetch_geotiff.py first.")
+
+
+def load_satellite_display(city: str, year: str) -> np.ndarray:
+    try:
+        return _load_display_raw(city, year)
+    except FileNotFoundError:
+        raise HTTPException(404, f"No display image for {city} {year}. Run satellite_fetch.py first.")
 
 
 # ---------------------------------------------------------------------------
@@ -947,8 +1084,8 @@ def list_cities():
 def list_years(city: str):
     years = set()
     for f in os.listdir(STATIC_DIR):
-        if f.startswith(f"satellite_{city}_") and f.endswith(".png"):
-            y = f.replace(f"satellite_{city}_", "").replace(".png", "")
+        if f.startswith(f"satellite_{city}_") and f.endswith(".tif"):
+            y = f.replace(f"satellite_{city}_", "").replace(".tif", "")
             years.add(y)
     return {"years": sorted(years)}
 
@@ -962,13 +1099,14 @@ def analyze(city: str, year: str):
     if city not in CITIES:
         raise HTTPException(400, f"Unknown city: {city}")
 
-    img_rgb  = load_satellite(city, year)
-    nir      = load_nir(city, year)
+    img_rgb     = load_satellite(city, year)          # real reflectance, for FVI math
+    nir         = load_nir(city, year)
+    display_img = load_satellite_display(city, year)   # gamma PNG, for the overlay background
     mask, (t1, t2) = compute_fvi_mask(img_rgb, nir)
     pixel_ha = pixel_area_ha(CITIES[city]["buffer_km"])
     metrics       = carbon_metrics(mask, pixel_ha)
     fragmentation = compute_fragmentation_metrics(mask, pixel_ha)
-    overlay  = make_overlay(img_rgb, mask)
+    overlay  = make_overlay(display_img, mask)
 
     cv2.imwrite(os.path.join(STATIC_DIR, f"mask_{city}_{year}.png"),    mask)
     cv2.imwrite(os.path.join(STATIC_DIR, f"overlay_{city}_{year}.png"), overlay)
@@ -1070,9 +1208,9 @@ def predict(city: str, target_year: int):
         raise HTTPException(400, f"Unknown city: {city}")
 
     known_years = sorted(
-        (f.replace(f"satellite_{city}_", "").replace(".png", "")
+        (f.replace(f"satellite_{city}_", "").replace(".tif", "")
          for f in os.listdir(STATIC_DIR)
-         if f.startswith(f"satellite_{city}_") and f.endswith(".png")),
+         if f.startswith(f"satellite_{city}_") and f.endswith(".tif")),
         key=int,
     )
     if len(known_years) < 3:
@@ -1097,7 +1235,7 @@ def predict(city: str, target_year: int):
     ca_ann_model, ca_ann_beta = load_ca_ann_model()
     if ca_ann_model is not None:
         projected_mask, meta = project_future_mask_ca_ann(
-            ca_ann_model, ca_ann_beta, masks_by_year, target_year)
+            ca_ann_model, ca_ann_beta, city, masks_by_year, target_year)
         stats = load_ca_ann_stats()
         if stats is not None:
             validation = select_multiyear_validation(stats, meta["elapsed_years"])
@@ -1109,7 +1247,7 @@ def predict(city: str, target_year: int):
         validation = validate_prediction(masks_by_year)
         meta["method"] = "density_heuristic_fallback"
 
-    latest_img  = load_satellite(city, latest_year)
+    latest_img  = load_satellite_display(city, latest_year)
     latest_mask = masks_by_year[latest_year]
     gain_pixels = projected_mask & ~latest_mask
     loss_pixels = ~projected_mask & latest_mask
@@ -1186,7 +1324,7 @@ def risk_heatmap(city: str, high_risk_percentile: float = 90.0):
     # endpoint reports the raw unfiltered total.
     significant_mask = filter_min_mapping_unit(latest_mask, pixel_ha)
 
-    latest_img = load_satellite(city, latest_year)
+    latest_img = load_satellite_display(city, latest_year)
     heatmap = render_risk_heatmap(latest_img, ann_score, significant_mask)
     cv2.imwrite(os.path.join(STATIC_DIR, f"risk_{city}_{latest_year}.png"), heatmap)
 

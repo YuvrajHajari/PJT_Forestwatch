@@ -48,6 +48,9 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import cohen_kappa_score
 import joblib
 
+if sys.stdout.encoding != "utf-8":  # Windows cp1252 console can't print the arrow below
+    sys.stdout.reconfigure(encoding="utf-8")
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import main as fw
 
@@ -67,9 +70,9 @@ def load_all_masks():
         print(f"  [{city}] global threshold: t1={global_t[0]}  t2={global_t[1]}")
 
         years = sorted(
-            (f.replace(f"satellite_{city}_", "").replace(".png", "")
+            (f.replace(f"satellite_{city}_", "").replace(".tif", "")
              for f in os.listdir(fw.STATIC_DIR)
-             if f.startswith(f"satellite_{city}_") and f.endswith(".png")),
+             if f.startswith(f"satellite_{city}_") and f.endswith(".tif")),
             key=int,
         )
         for year in years:
@@ -178,7 +181,7 @@ def run_multiyear_validation(masks):
             model, beta = train_mlp(X_train, y_train)
 
             old_pred, _ = fw.project_future_mask(train_masks_bool, int(target_year))
-            ann_pred, _ = fw.project_future_mask_ca_ann(model, beta, train_masks_bool, int(target_year))
+            ann_pred, _ = fw.project_future_mask_ca_ann(model, beta, city, train_masks_bool, int(target_year))
             actual = masks[(city, target_year)]
 
             def score(pred):
@@ -240,12 +243,15 @@ def get_consecutive_transitions(masks):
 def build_training_set(masks, transitions):
     """
     masks: {(city, year): bool mask}, transitions: [(city, ya, yb), ...].
-    Features computed from mA (the "before" state) via fw.multiscale_features.
+    Features computed from mA (the "before" state) via
+    fw.multiscale_features_v2 -- the 4 hand-engineered features plus
+    Clay v1.5's PCA-reduced embedding for that city/year (see
+    extract_clay_embeddings.py).
     """
     X_list, y_list = [], []
     for city, ya, yb in transitions:
         mA, mB = masks[(city, ya)], masks[(city, yb)]
-        X_list.append(fw.multiscale_features(mA))
+        X_list.append(fw.multiscale_features_v2(mA, city, ya))
         y_list.append((mA != mB).astype(np.int32).reshape(-1))
     return np.concatenate(X_list), np.concatenate(y_list)
 
@@ -316,7 +322,7 @@ def evaluate_split(model, beta, masks, test_transition):
     train_masks_bool = {y: masks[(city, y)] for y in train_years}
 
     old_pred, _ = fw.project_future_mask(train_masks_bool, int(yb))
-    ann_pred, _ = fw.project_future_mask_ca_ann(model, beta, train_masks_bool, int(yb))
+    ann_pred, _ = fw.project_future_mask_ca_ann(model, beta, city, train_masks_bool, int(yb))
     actual = masks[(city, yb)]
 
     def score(pred):

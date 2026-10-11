@@ -4,6 +4,8 @@ static/
 *.png
 ca_ann_model.joblib
 ca_ann_model_stats.json
+ca_ann_model_bengaluru.joblib
+ca_ann_model_stats_bengaluru.json
 
 # Secrets
 .env
@@ -17,6 +19,9 @@ venv/
 # Frontend (regenerable via npm install)
 forestwatch-frontend/node_modules/
 forestwatch-frontend/dist/
+
+# Clay model weights (5GB+, re-downloadable, never commit)
+checkpoints/
 
 # OS/editor cruft
 .DS_Store

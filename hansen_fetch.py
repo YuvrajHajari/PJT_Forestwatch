@@ -38,11 +38,15 @@ Produces (one pair per city, not per year):
     static/hansen_lossyear_{city}.png   -- lossyear, 0-25 -> 0-255
 """
 import os
+import sys
 import ee
 import requests
 import numpy as np
 import cv2
 from dotenv import load_dotenv
+
+if sys.stdout.encoding != "utf-8":  # Windows cp1252 console can't print the emoji below
+    sys.stdout.reconfigure(encoding="utf-8")
 
 load_dotenv()
 
