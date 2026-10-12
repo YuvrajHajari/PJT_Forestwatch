@@ -1,0 +1,48 @@
+{
+  "city": "bengaluru",
+  "method": "ca_ann_ensemble_ranked_markov_count",
+  "n_seeds": 8,
+  "markov_min_gap_years": 3,
+  "threshold_mode": "global_pooled",
+  "note": "8-seed ensemble (averaged raw probabilities, calibrated once) -- built to address CA-ANN-vs-baseline deltas flipping sign across different training runs of the single-seed model. Kappa values are exact (directly measured). pixel_agreement_pct values are exactly back-derived from Kappa via the standard p_o = kappa*(1-p_e)+p_e relationship, using p_e computed from the deterministic Markov-rate pixel budget (identical between the baseline and CA-ANN methods at a given test point, since both share the same budget and only differ in WHICH pixels are chosen) -- not re-measured by rerunning the ensemble, since that budget/p_e computation doesn't require the trained model at all.",
+  "spatial_ranking_validation": {
+    "n_test_points": 4,
+    "wins": 3,
+    "mean_old_kappa": 0.68935,
+    "mean_ca_ann_kappa": 0.688875,
+    "mean_kappa_delta": -0.000475,
+    "per_test_results": [
+      {"test": ["bengaluru", "2021", "2022"], "old_kappa": 0.7967, "ca_ann_kappa": 0.7839, "delta": -0.0127},
+      {"test": ["bengaluru", "2022", "2023"], "old_kappa": 0.8063, "ca_ann_kappa": 0.8096, "delta": 0.0033},
+      {"test": ["bengaluru", "2023", "2024"], "old_kappa": 0.5854, "ca_ann_kappa": 0.5909, "delta": 0.0056},
+      {"test": ["bengaluru", "2024", "2025"], "old_kappa": 0.5690, "ca_ann_kappa": 0.5711, "delta": 0.0021}
+    ],
+    "note": "Consecutive 1-year-ahead transitions, 8-seed ensemble."
+  },
+  "multiyear_projection_validation": {
+    "by_horizon": {
+      "3": {
+        "available": true,
+        "n_test_points": 4,
+        "wins": 3,
+        "mean_old_kappa": 0.55555,
+        "mean_ca_ann_kappa": 0.55975,
+        "mean_old_agree": 94.365,
+        "mean_ca_ann_agree": 94.4275
+      },
+      "6": {
+        "available": true,
+        "n_test_points": 1,
+        "wins": 1,
+        "mean_old_kappa": 0.2832,
+        "mean_ca_ann_kappa": 0.3046,
+        "mean_old_agree": 91.15,
+        "mean_ca_ann_agree": 91.41
+      },
+      "9": {
+        "available": false,
+        "reason": "Not enough historical years to backtest a 9-year horizon (needs training data starting at least 3yr before a cutoff that still leaves 9yr of held-out years to test against). Will become available once more years are fetched."
+      }
+    }
+  }
+}

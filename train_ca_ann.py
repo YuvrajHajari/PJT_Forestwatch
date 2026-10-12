@@ -181,7 +181,7 @@ def run_multiyear_validation(masks):
             model, beta = train_mlp(X_train, y_train)
 
             old_pred, _ = fw.project_future_mask(train_masks_bool, int(target_year))
-            ann_pred, _ = fw.project_future_mask_ca_ann(model, beta, city, train_masks_bool, int(target_year))
+            ann_pred, _ = fw.project_future_mask_ca_ann([(model, beta)], city, train_masks_bool, int(target_year))
             actual = masks[(city, target_year)]
 
             def score(pred):
@@ -322,7 +322,7 @@ def evaluate_split(model, beta, masks, test_transition):
     train_masks_bool = {y: masks[(city, y)] for y in train_years}
 
     old_pred, _ = fw.project_future_mask(train_masks_bool, int(yb))
-    ann_pred, _ = fw.project_future_mask_ca_ann(model, beta, city, train_masks_bool, int(yb))
+    ann_pred, _ = fw.project_future_mask_ca_ann([(model, beta)], city, train_masks_bool, int(yb))
     actual = masks[(city, yb)]
 
     def score(pred):

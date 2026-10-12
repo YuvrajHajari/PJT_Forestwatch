@@ -399,7 +399,21 @@ def compute_local_forest_density(mask: np.ndarray, window: int = 15) -> np.ndarr
 
 CA_ANN_MODEL_PATH = os.path.join(BASE_DIR, "ca_ann_model.joblib")
 CA_ANN_STATS_PATH = os.path.join(BASE_DIR, "ca_ann_model_stats.json")
-_ca_ann_cache = {"model": None, "beta": None, "loaded": False}
+
+# Per-city overrides -- a city can ship its own specialized model+stats
+# (e.g. Bengaluru's 8-seed ensemble, which averages several independently
+# -seeded fits to address CA-ANN-vs-baseline deltas that were flipping
+# sign across different training runs of the single-seed pooled model --
+# see bengaluru_ensemble_experiment.py). Falls back to the shared pooled
+# model for any city without its own override.
+CA_ANN_CITY_OVERRIDES = {
+    "bengaluru": {
+        "model": os.path.join(BASE_DIR, "ca_ann_model_bengaluru_ensemble.joblib"),
+        "stats": os.path.join(BASE_DIR, "ca_ann_model_stats_bengaluru_ensemble.json"),
+    },
+}
+
+_ca_ann_cache: dict = {}  # city -> list of (model, beta) tuples ("ensemble" of size 1 for the pooled model)
 
 
 def multiscale_features(mask_bool: np.ndarray) -> np.ndarray:
@@ -541,25 +555,40 @@ def calibrate_proba(p_resampled: np.ndarray, beta: float) -> np.ndarray:
     return corrected_odds / (1 + corrected_odds)
 
 
-def load_ca_ann_model():
+def load_ca_ann_model(city: str):
     """
-    Loads the offline-trained CA-ANN model (produced by train_ca_ann.py),
-    cached after first load. Returns (None, None) if no model exists yet.
+    Loads the offline-trained CA-ANN model for this city, cached after
+    first load per city. Returns a LIST of (model, beta) tuples -- length
+    1 for the shared pooled model, length N for a city with its own
+    multi-seed ensemble override (see CA_ANN_CITY_OVERRIDES). Treating
+    every city uniformly as "a list of models to average" means the
+    single-model case needs no special-casing: averaging one model's
+    output is identical to using it directly.
+
+    Returns None if no model exists yet for either this city or the
+    shared pooled fallback.
     """
-    if not _ca_ann_cache["loaded"]:
-        if os.path.exists(CA_ANN_MODEL_PATH):
-            import joblib
+    if city not in _ca_ann_cache:
+        import joblib
+        override = CA_ANN_CITY_OVERRIDES.get(city)
+        if override and os.path.exists(override["model"]):
+            saved = joblib.load(override["model"])
+            _ca_ann_cache[city] = saved["ensemble"]  # already a list of (model, beta)
+        elif os.path.exists(CA_ANN_MODEL_PATH):
             saved = joblib.load(CA_ANN_MODEL_PATH)
-            _ca_ann_cache["model"] = saved["model"]
-            _ca_ann_cache["beta"]  = saved["beta"]
-        _ca_ann_cache["loaded"] = True
-    return _ca_ann_cache["model"], _ca_ann_cache["beta"]
+            _ca_ann_cache[city] = [(saved["model"], saved["beta"])]
+        else:
+            _ca_ann_cache[city] = None
+    return _ca_ann_cache[city]
 
 
-def load_ca_ann_stats():
-    """Walk-forward validation stats saved by train_ca_ann.py."""
-    if os.path.exists(CA_ANN_STATS_PATH):
-        with open(CA_ANN_STATS_PATH) as f:
+def load_ca_ann_stats(city: str):
+    """Walk-forward validation stats, preferring a city-specific override
+    (e.g. Bengaluru's ensemble stats) over the shared pooled stats file."""
+    override = CA_ANN_CITY_OVERRIDES.get(city)
+    path = override["stats"] if override and os.path.exists(override["stats"]) else CA_ANN_STATS_PATH
+    if os.path.exists(path):
+        with open(path) as f:
             return json.load(f)
     return None
 
@@ -722,19 +751,21 @@ def _prepare_city_risk_context(city: str):
         mask, _ = compute_fvi_mask(img, nir, fixed_thresholds=global_t)
         masks_by_year[y] = mask > 127
 
-    ca_ann_model, ca_ann_beta = load_ca_ann_model()
-    if ca_ann_model is None:
+    ca_ann_ensemble = load_ca_ann_model(city)
+    if ca_ann_ensemble is None:
         raise HTTPException(400, "No trained CA-ANN model found -- run train_ca_ann.py first.")
 
     latest_mask = masks_by_year[latest_year]
-    X     = multiscale_features_v2(latest_mask, city, latest_year)
-    raw_p = ca_ann_model.predict_proba(X)[:, 1]
-    ann_score = calibrate_proba(raw_p, ca_ann_beta).reshape(latest_mask.shape)
+    X          = multiscale_features_v2(latest_mask, city, latest_year)
+    raw_p_list = [model.predict_proba(X)[:, 1] for model, _ in ca_ann_ensemble]
+    raw_p      = np.mean(raw_p_list, axis=0)
+    beta_avg   = float(np.mean([beta for _, beta in ca_ann_ensemble]))
+    ann_score  = calibrate_proba(raw_p, beta_avg).reshape(latest_mask.shape)
 
     return latest_year, latest_mask, ann_score
 
 
-def project_future_mask_ca_ann(model, beta: float, city: str,
+def project_future_mask_ca_ann(models_and_betas: list, city: str,
                                 masks_by_year: dict, target_year: int):
     """
     CA-ANN projection.
@@ -791,9 +822,16 @@ def project_future_mask_ca_ann(model, beta: float, city: str,
     expected_loss_px = min(forest_count,     int(round(p_loss_compound * forest_count)))
 
     # WHICH: CA-ANN calibrated score, used only as a ranking signal.
-    X         = multiscale_features_v2(latest_mask, city, latest_year)
-    raw_p     = model.predict_proba(X)[:, 1]
-    ann_score = calibrate_proba(raw_p, beta).reshape(latest_mask.shape)
+    # Averaging raw probabilities across every ensemble member BEFORE
+    # calibrating once reduces the run-to-run variance a single seed
+    # showed (see bengaluru_ensemble_experiment.py) -- for a
+    # single-model "ensemble" of length 1, this is identical to the
+    # original single-model behavior.
+    X           = multiscale_features_v2(latest_mask, city, latest_year)
+    raw_p_list  = [model.predict_proba(X)[:, 1] for model, _ in models_and_betas]
+    raw_p       = np.mean(raw_p_list, axis=0)
+    beta_avg    = float(np.mean([beta for _, beta in models_and_betas]))
+    ann_score   = calibrate_proba(raw_p, beta_avg).reshape(latest_mask.shape)
 
     # Gain candidates: non-forest pixels, ranked by CA-ANN score
     # descending (bare land adjacent to existing forest scores highest --
@@ -825,6 +863,7 @@ def project_future_mask_ca_ann(model, beta: float, city: str,
         "predicted_gain_px": int(np.sum(gain_mask)),
         "predicted_loss_px": int(np.sum(loss_mask)),
         "method":            "ca_ann_ranked_markov_count",
+        "n_seeds":           len(models_and_betas),
         "threshold_mode":    "global_pooled",
         "min_gap_years":     MIN_TRANSITION_GAP_YEARS,
     }
@@ -1232,11 +1271,11 @@ def predict(city: str, target_year: int):
         mask, _ = compute_fvi_mask(img, nir, fixed_thresholds=global_t)
         masks_by_year[y] = mask > 127
 
-    ca_ann_model, ca_ann_beta = load_ca_ann_model()
-    if ca_ann_model is not None:
+    ca_ann_ensemble = load_ca_ann_model(city)
+    if ca_ann_ensemble is not None:
         projected_mask, meta = project_future_mask_ca_ann(
-            ca_ann_model, ca_ann_beta, city, masks_by_year, target_year)
-        stats = load_ca_ann_stats()
+            ca_ann_ensemble, city, masks_by_year, target_year)
+        stats = load_ca_ann_stats(city)
         if stats is not None:
             validation = select_multiyear_validation(stats, meta["elapsed_years"])
         else:
