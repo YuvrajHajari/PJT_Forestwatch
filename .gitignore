@@ -7,6 +7,17 @@ ca_ann_model_stats.json
 ca_ann_model_bengaluru.joblib
 ca_ann_model_stats_bengaluru.json
 
+# ...except the frontend's own static assets, which are hand-built and committed,
+# not generated output -- the site needs these to render.
+!forestwatch-frontend/public/**/*.png
+!forestwatch-frontend/src/**/*.png
+
+# Scratch logs from one-off diagnostic scripts
+*.log
+
+# Submitted coursework, not for public distribution
+ForestWatch_India_Project_Report.docx
+
 # Secrets
 .env
 

@@ -6,19 +6,37 @@
 // original index.html, made slightly easier to fix here.
 export const API_BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
 
+// Dedupe identical concurrent GETs -- React StrictMode double-invokes
+// every effect in development, which otherwise fires two parallel
+// requests to the same slow endpoint (conservation-priority and risk
+// both run a full CA-ANN pass, 20-30s each) and roughly doubles the real
+// wait by making the backend do the same expensive work twice at once.
+const inFlight = new Map();
+
 async function getJSON(path) {
-  const res = await fetch(`${API_BASE}${path}`);
-  if (!res.ok) {
-    let detail = res.statusText;
-    try {
-      const body = await res.json();
-      detail = body.detail || detail;
-    } catch {
-      /* response wasn't JSON, fall back to statusText */
+  if (inFlight.has(path)) return inFlight.get(path);
+
+  const promise = (async () => {
+    const res = await fetch(`${API_BASE}${path}`);
+    if (!res.ok) {
+      let detail = res.statusText;
+      try {
+        const body = await res.json();
+        detail = body.detail || detail;
+      } catch {
+        /* response wasn't JSON, fall back to statusText */
+      }
+      throw new Error(detail);
     }
-    throw new Error(detail);
+    return res.json();
+  })();
+
+  inFlight.set(path, promise);
+  try {
+    return await promise;
+  } finally {
+    inFlight.delete(path);
   }
-  return res.json();
 }
 
 // Direct URL to an already-fetched satellite image, bypassing /analyze

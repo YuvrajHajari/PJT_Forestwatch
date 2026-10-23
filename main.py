@@ -1,8 +1,9 @@
 import os
 import json
+import math
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
@@ -30,7 +31,32 @@ CITIES = {
 }
 
 IMAGE_SIZE = 1024
-BASE_URL = "http://127.0.0.1:8000/static"
+BASE_URL = "http://127.0.0.1:8000/static"  # fallback for any offline/script use outside a request
+
+
+def approx_pixel_latlon(city: str, px: float, py: float) -> tuple[float, float]:
+    """Simple equirectangular approximation from pixel position to lat/lon,
+    using the same square-grid assumption already used elsewhere in this
+    codebase (e.g. extract_clay_embeddings.py's gsd calculation) rather
+    than the exact per-fetch GDAL affine transform. Good enough to label
+    a conservation-priority patch with its nearest named place, not
+    survey-grade -- see compute_conservation_priority's docstring for the
+    full accuracy caveat."""
+    cfg = CITIES[city]
+    meters_per_px = (2 * cfg["buffer_km"] * 1000) / IMAGE_SIZE
+    dx_m = (px - IMAGE_SIZE / 2) * meters_per_px
+    dy_m = (IMAGE_SIZE / 2 - py) * meters_per_px
+    lat = cfg["lat"] + dy_m / 111320.0
+    lon = cfg["lon"] + dx_m / (111320.0 * math.cos(math.radians(cfg["lat"])))
+    return round(lat, 5), round(lon, 5)
+
+
+def static_base_url(request: Request) -> str:
+    """Build the /static URL from the incoming request's own host, so image
+    URLs resolve correctly whether the API is reached at 127.0.0.1:8000 (dev)
+    or a deployed host/port (demo) -- previously hardcoded to BASE_URL above,
+    which silently broke every image URL off localhost."""
+    return f"{str(request.base_url).rstrip('/')}/static"
 
 # ---------------------------------------------------------------------------
 # Global threshold cache
@@ -349,7 +375,8 @@ def make_overlay(img_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def compute_annual_transition_rates(masks_by_year: dict,
-                                    min_gap_years: int = MIN_TRANSITION_GAP_YEARS
+                                    min_gap_years: int = MIN_TRANSITION_GAP_YEARS,
+                                    recency_halflife_years: float = 0,
                                     ) -> tuple:
     """
     Estimates per-year p_gain (non-forest -> forest) and p_loss
@@ -360,24 +387,56 @@ def compute_annual_transition_rates(masks_by_year: dict,
     for the full diagnostic history: uncorrected annual pairing gave
     p_loss=18.8%/yr on Chennai data despite the real 9yr net change being
     a +264ha GAIN).
+
+    RECENCY WEIGHTING (recency_halflife_years > 0): an optional,
+    NOT-the-default, alternative that weights each qualifying pair by
+        0.5 ** (years_before_latest / recency_halflife_years)
+    instead of pooling all pairs flatly. TESTED AND REJECTED as the
+    production default: a full walk-forward re-validation across all
+    four cities (recency_halflife_years = min_gap_years) regressed mean
+    Kappa at every horizon -- 1yr 0.6880->0.6801 (3/16 wins), 3yr
+    0.5495->0.5316 (5/16 wins), 6yr 0.3033->0.2931 (1/4 wins) -- despite
+    being motivated by a real, confirmed bias (Bengaluru's own most
+    recent pairs showed lower loss / higher gain than the flat pooled
+    average). The flat estimator's robustness across many pairs, not its
+    staleness, turned out to matter more: recency weighting made the
+    budget oversensitive to whichever year was most recent in a given
+    walk-forward split, including a year (2024) whose pairs show an
+    elevated loss rate across every city, consistent with one noisy
+    composite rather than a real spike, and recency weighting cannot
+    tell that apart from a genuine trend. Kept here, disabled by
+    default, for the record rather than deleted -- the same treatment
+    given to the earlier-reverted temporal-trend feature below -- and as
+    a starting point if a longer time series later makes per-pair
+    variance low enough for recency weighting to help instead of hurt.
     """
     years = sorted(masks_by_year.keys(), key=int)
-    gain_events, gain_denominator = 0, 0.0
-    loss_events, loss_denominator = 0, 0.0
+    if not years:
+        return 0.0, 0.0
+    latest_year = int(years[-1])
+
+    gain_events, gain_denominator = 0.0, 0.0
+    loss_events, loss_denominator = 0.0, 0.0
 
     for i, y0 in enumerate(years):
         for y1 in years[i + 1:]:
             elapsed = int(y1) - int(y0)
             if elapsed < min_gap_years:
                 continue
+            if recency_halflife_years > 0:
+                years_before_latest = latest_year - int(y1)
+                weight = 0.5 ** (years_before_latest / recency_halflife_years)
+            else:
+                weight = 1.0
+
             m0, m1 = masks_by_year[y0], masks_by_year[y1]
             non_forest_0 = ~m0
             forest_0     =  m0
 
-            gain_events      += int(np.sum(non_forest_0 & m1))
-            gain_denominator += int(np.sum(non_forest_0)) * elapsed
-            loss_events      += int(np.sum(forest_0 & ~m1))
-            loss_denominator += int(np.sum(forest_0)) * elapsed
+            gain_events      += weight * int(np.sum(non_forest_0 & m1))
+            gain_denominator += weight * int(np.sum(non_forest_0)) * elapsed
+            loss_events      += weight * int(np.sum(forest_0 & ~m1))
+            loss_denominator += weight * int(np.sum(forest_0)) * elapsed
 
     p_gain = (gain_events / gain_denominator) if gain_denominator > 0 else 0.0
     p_loss = (loss_events / loss_denominator) if loss_denominator > 0 else 0.0
@@ -414,6 +473,54 @@ CA_ANN_CITY_OVERRIDES = {
 }
 
 _ca_ann_cache: dict = {}  # city -> list of (model, beta) tuples ("ensemble" of size 1 for the pooled model)
+
+# ---------------------------------------------------------------------------
+# Per-city masks-by-year cache
+#
+# /predict, /risk, and /conservation-priority each independently rebuilt
+# every known year's FVI+Otsu mask from disk on every single call -- reading
+# and processing up to a decade of 1024x1024 rasters is the single biggest
+# repeated cost behind their 20-30s response time (see api.js's comment on
+# the frontend side). known_years and the pooled global threshold can't
+# change while this server process is running, so caching this per city is
+# safe for the process's whole lifetime: the first call for a city pays the
+# full cost, every later call for that same city (even across these three
+# different endpoints) returns in milliseconds instead of recomputing.
+# ---------------------------------------------------------------------------
+_masks_by_year_cache: dict = {}
+
+
+def _get_masks_by_year(city: str):
+    if city in _masks_by_year_cache:
+        return _masks_by_year_cache[city]
+
+    known_years = sorted(
+        (f.replace(f"satellite_{city}_", "").replace(".tif", "")
+         for f in os.listdir(STATIC_DIR)
+         if f.startswith(f"satellite_{city}_") and f.endswith(".tif")),
+        key=int,
+    )
+    global_t = get_global_thresholds(city)
+    masks_by_year = {}
+    for y in known_years:
+        img = load_satellite(city, y)
+        nir = load_nir(city, y)
+        mask, _ = compute_fvi_mask(img, nir, fixed_thresholds=global_t)
+        masks_by_year[y] = mask > 127
+
+    _masks_by_year_cache[city] = (known_years, masks_by_year)
+    return known_years, masks_by_year
+
+
+# Full risk context (latest_year, latest_mask, ann_score) for /risk and
+# /conservation-priority -- same reasoning as _masks_by_year_cache above,
+# this additionally skips re-running the CA-ANN ensemble inference pass.
+_risk_context_cache: dict = {}
+
+# Full /predict response, keyed by (city, target_year) -- same reasoning
+# again, skips re-running the CA-ANN projection and re-writing the overlay
+# PNG for a target year that's already been projected this process.
+_predict_cache: dict = {}
 
 
 def multiscale_features(mask_bool: np.ndarray) -> np.ndarray:
@@ -733,23 +840,14 @@ def _prepare_city_risk_context(city: str):
     if city not in CITIES:
         raise HTTPException(400, f"Unknown city: {city}")
 
-    known_years = sorted(
-        (f.replace(f"satellite_{city}_", "").replace(".tif", "")
-         for f in os.listdir(STATIC_DIR)
-         if f.startswith(f"satellite_{city}_") and f.endswith(".tif")),
-        key=int,
-    )
+    if city in _risk_context_cache:
+        return _risk_context_cache[city]
+
+    known_years, masks_by_year = _get_masks_by_year(city)
     if len(known_years) < 3:
         raise HTTPException(400, "Need at least 3 known years of data before this can be computed.")
 
     latest_year = known_years[-1]
-    global_t    = get_global_thresholds(city)
-    masks_by_year = {}
-    for y in known_years:
-        img = load_satellite(city, y)
-        nir = load_nir(city, y)
-        mask, _ = compute_fvi_mask(img, nir, fixed_thresholds=global_t)
-        masks_by_year[y] = mask > 127
 
     ca_ann_ensemble = load_ca_ann_model(city)
     if ca_ann_ensemble is None:
@@ -762,7 +860,9 @@ def _prepare_city_risk_context(city: str):
     beta_avg   = float(np.mean([beta for _, beta in ca_ann_ensemble]))
     ann_score  = calibrate_proba(raw_p, beta_avg).reshape(latest_mask.shape)
 
-    return latest_year, latest_mask, ann_score
+    result = (latest_year, latest_mask, ann_score)
+    _risk_context_cache[city] = result
+    return result
 
 
 def project_future_mask_ca_ann(models_and_betas: list, city: str,
@@ -1130,7 +1230,7 @@ def list_years(city: str):
 
 
 @app.get("/analyze/{city}/{year}")
-def analyze(city: str, year: str):
+def analyze(city: str, year: str, request: Request):
     """
     Single-year analysis. Per-image Otsu thresholds -- correct for
     single-scene detection where no cross-year comparison is needed.
@@ -1152,9 +1252,9 @@ def analyze(city: str, year: str):
 
     return {
         "city": city, "year": year,
-        "satellite_url": f"{BASE_URL}/satellite_{city}_{year}.png",
-        "mask_url":      f"{BASE_URL}/mask_{city}_{year}.png",
-        "overlay_url":   f"{BASE_URL}/overlay_{city}_{year}.png",
+        "satellite_url": f"{static_base_url(request)}/satellite_{city}_{year}.png",
+        "mask_url":      f"{static_base_url(request)}/mask_{city}_{year}.png",
+        "overlay_url":   f"{static_base_url(request)}/overlay_{city}_{year}.png",
         "fvi_thresholds_used": {"water_max": t1, "forest_min": t2},
         "fragmentation": fragmentation,
         **metrics,
@@ -1162,7 +1262,7 @@ def analyze(city: str, year: str):
 
 
 @app.get("/compare/{city}/{year_a}/{year_b}")
-def compare(city: str, year_a: str, year_b: str):
+def compare(city: str, year_a: str, year_b: str, request: Request):
     """
     Two-year change detection. Per-image Otsu per year; MMU filter
     suppresses boundary-flip noise in the change masks.
@@ -1206,7 +1306,7 @@ def compare(city: str, year_a: str, year_b: str):
     return {
         "city": city,
         "year_a": year_a, "year_b": year_b,
-        "diff_url": f"{BASE_URL}/diff_{city}_{year_a}_{year_b}.png",
+        "diff_url": f"{static_base_url(request)}/diff_{city}_{year_a}_{year_b}.png",
         "min_mapping_unit_ha": MIN_MAPPING_UNIT_HA,
         "year_a_data": {**metrics_a, "fvi_thresholds_used": {"water_max": t1_a, "forest_min": t2_a}},
         "year_b_data": {**metrics_b, "fvi_thresholds_used": {"water_max": t1_b, "forest_min": t2_b}},
@@ -1221,7 +1321,7 @@ def compare(city: str, year_a: str, year_b: str):
 
 
 @app.get("/predict/{city}/{target_year}")
-def predict(city: str, target_year: int):
+def predict(city: str, target_year: int, request: Request):
     """
     Future projection with three fixes applied (see docstrings above for
     full diagnostic history):
@@ -1246,12 +1346,11 @@ def predict(city: str, target_year: int):
     if city not in CITIES:
         raise HTTPException(400, f"Unknown city: {city}")
 
-    known_years = sorted(
-        (f.replace(f"satellite_{city}_", "").replace(".tif", "")
-         for f in os.listdir(STATIC_DIR)
-         if f.startswith(f"satellite_{city}_") and f.endswith(".tif")),
-        key=int,
-    )
+    cache_key = (city, target_year)
+    if cache_key in _predict_cache:
+        return _predict_cache[cache_key]
+
+    known_years, masks_by_year = _get_masks_by_year(city)
     if len(known_years) < 3:
         raise HTTPException(400,
             "Need at least 3 known years of data before a projection can be made.")
@@ -1262,14 +1361,6 @@ def predict(city: str, target_year: int):
             f"target_year must be after the latest known year ({latest_year}).")
 
     pixel_ha = pixel_area_ha(CITIES[city]["buffer_km"])
-
-    global_t = get_global_thresholds(city)
-    masks_by_year = {}
-    for y in known_years:
-        img = load_satellite(city, y)
-        nir = load_nir(city, y)
-        mask, _ = compute_fvi_mask(img, nir, fixed_thresholds=global_t)
-        masks_by_year[y] = mask > 127
 
     ca_ann_ensemble = load_ca_ann_model(city)
     if ca_ann_ensemble is not None:
@@ -1307,20 +1398,22 @@ def predict(city: str, target_year: int):
     latest_fragmentation = compute_fragmentation_metrics(
         latest_mask.astype(np.uint8) * 255, pixel_ha)
 
-    return {
+    result = {
         "city":            city,
         "base_year":       latest_year,
         "target_year":     target_year,
-        "predict_url":     f"{BASE_URL}/predict_{city}_{target_year}.png",
+        "predict_url":     f"{static_base_url(request)}/predict_{city}_{target_year}.png",
         "base_year_data":  {**latest_metrics,    "fragmentation": latest_fragmentation},
         "projected_data":  {**projected_metrics, "fragmentation": projected_fragmentation},
         "projection_meta": meta,
         "validation":      validation,
     }
+    _predict_cache[cache_key] = result
+    return result
 
 
 @app.get("/risk/{city}")
-def risk_heatmap(city: str, high_risk_percentile: float = 90.0):
+def risk_heatmap(city: str, request: Request, high_risk_percentile: float = 90.0):
     """
     Continuous deforestation risk heatmap for the latest available year,
     using the CA-ANN's own calibrated per-pixel change probability
@@ -1380,7 +1473,7 @@ def risk_heatmap(city: str, high_risk_percentile: float = 90.0):
     return {
         "city": city,
         "year": latest_year,
-        "risk_heatmap_url": f"{BASE_URL}/risk_{city}_{latest_year}.png",
+        "risk_heatmap_url": f"{static_base_url(request)}/risk_{city}_{latest_year}.png",
         "significant_forest_area_ha": round(forest_px * pixel_ha, 2),
         "high_risk_percentile":  high_risk_percentile,
         "high_risk_area_ha":     round(high_risk_px * pixel_ha, 2),
@@ -1409,6 +1502,10 @@ def conservation_priority(city: str, min_patch_ha: float = 0.5, top_n: int = 10)
     priority_patches = compute_conservation_priority(
         latest_mask.astype(np.uint8) * 255, ann_score, pixel_ha,
         min_patch_ha=min_patch_ha, top_n=top_n)
+    for p in priority_patches:
+        lat, lon = approx_pixel_latlon(city, p["centroid_px"]["x"], p["centroid_px"]["y"])
+        p["approx_lat"] = lat
+        p["approx_lon"] = lon
 
     return {
         "city": city,
@@ -1602,7 +1699,7 @@ def compute_buffered_agreement(our_mask: np.ndarray, reference_mask: np.ndarray,
 
 
 @app.get("/validate-hansen/{city}/{year}")
-def validate_hansen(city: str, year: str,
+def validate_hansen(city: str, year: str, request: Request,
                     canopy_threshold: float = HANSEN_CANOPY_THRESHOLD_DEFAULT,
                     buffer_m: float = 30.0):
     """
@@ -1680,7 +1777,7 @@ def validate_hansen(city: str, year: str,
         "canopy_threshold_pct":   canopy_threshold,
         "our_forest_area_ha":     our_area_ha,
         "hansen_forest_area_ha":  hansen_area_ha,
-        "diff_url": f"{BASE_URL}/hansen_diff_{city}_{year}.png",
+        "diff_url": f"{static_base_url(request)}/hansen_diff_{city}_{year}.png",
         "validation_metrics": metrics,
         "buffered_agreement": buffered,
         "methodology_note": (

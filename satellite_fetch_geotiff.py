@@ -45,6 +45,32 @@ def _region_for(cfg):
     return point.buffer(cfg["buffer_km"] * 1000).bounds()  # bounds() -> real rectangular AOI, matches getDownloadURL's expectations
 
 
+# ---------------------------------------------------------------------------
+# Per-pixel cloud/cirrus/shadow masking
+#
+# CLOUDY_PIXEL_PERCENTAGE (used below in filterDate+filter) describes cloud
+# cover across the ENTIRE ~100x100km Sentinel-2 tile, not our ~12x12km AOI.
+# A scene can pass that whole-tile filter while still having a cloud or haze
+# patch sitting directly over a specific city's small bounding box, which the
+# median() composite then bakes in. Diagnosed concretely: Bengaluru's and
+# Chennai's 2024 composites show a forest-area dip (Bengaluru: 1,260.8ha in
+# 2023 -> 635.6ha in 2024 -> 1,454.4ha in 2025) that is not matched by any
+# corresponding dip in CLOUDY_PIXEL_PERCENTAGE for that year's scenes (2024's
+# values were, if anything, slightly better than 2023's), and the 2024
+# composite image is visibly hazier/lower-contrast than its neighbours on
+# inspection. This masks actual cloud/cirrus/shadow pixels per-pixel using
+# the SCL (Scene Classification Layer) band before compositing, which
+# median() then ignores rather than including, instead of relying on the
+# coarse whole-tile percentage alone.
+# ---------------------------------------------------------------------------
+_SCL_CLOUD_SHADOW_CIRRUS = [3, 8, 9, 10]  # cloud shadow, cloud (med/high prob), thin cirrus
+
+def _mask_clouds(image):
+    scl = image.select("SCL")
+    clear = scl.remap(_SCL_CLOUD_SHADOW_CIRRUS, [0] * len(_SCL_CLOUD_SHADOW_CIRRUS), 1)
+    return image.updateMask(clear)
+
+
 def fetch_rgb_geotiff(city_key, cfg, year):
     """
     Real, unclipped Sentinel-2 SR reflectance (R,G,B), as a GeoTIFF --
@@ -58,6 +84,7 @@ def fetch_rgb_geotiff(city_key, cfg, year):
         .filterBounds(region)
         .filterDate(f"{year}-01-01", f"{year}-05-31")
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
+        .map(_mask_clouds)
         .select(["B4", "B3", "B2"])  # R, G, B -- order preserved through to the GeoTIFF bands
         .median()
     )
@@ -79,6 +106,7 @@ def fetch_nir_geotiff(city_key, cfg, year):
         .filterBounds(region)
         .filterDate(f"{year}-01-01", f"{year}-05-31")
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
+        .map(_mask_clouds)
         .select(["B8"])
         .median()
     )
